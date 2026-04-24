@@ -72,7 +72,7 @@ def generate_dashboard(conn: sqlite3.Connection, output_path: str, chinese_data=
 
     # All skills for graph + table
     all_skills = _query(conn,
-        "SELECT name, source, stars, downloads, quality_score, category FROM skills ORDER BY stars DESC")
+        "SELECT name, source, stars, downloads, quality_score, category, COALESCE(url,'') FROM skills ORDER BY stars DESC")
 
     top_skills = all_skills[:15]
 
@@ -112,6 +112,31 @@ def generate_dashboard(conn: sqlite3.Connection, output_path: str, chinese_data=
     print(f"[dashboard] Written to {output_path}")
 
 
+def _auto_recommend(all_skills):
+    """Auto-generate recommendations: top quality skills from diverse categories."""
+    by_cat = {}
+    for s in all_skills:
+        cat = s[5] if len(s) > 5 else 'other'
+        if cat not in by_cat:
+            by_cat[cat] = []
+        by_cat[cat].append(s)
+    recs = []
+    # Pick best quality skill from each category (up to 8)
+    for cat in sorted(by_cat.keys()):
+        skills = sorted(by_cat[cat], key=lambda x: (x[4] if len(x) > 4 else 0, x[2] if len(x) > 2 else 0), reverse=True)
+        if skills:
+            s = skills[0]
+            recs.append({
+                "name": s[0],
+                "category": cat,
+                "quality_score": round(s[4], 1) if len(s) > 4 else 0,
+                "url": s[6] if len(s) > 6 and s[6] else "",
+                "reason": f"Top rated in {cat} ({s[2]} stars)" if len(s) > 2 else f"Top rated in {cat}"
+            })
+    # Sort by quality descending, take top 8
+    recs.sort(key=lambda x: x["quality_score"], reverse=True)
+    return recs[:8]
+
 def _build_html(*, total, avg_q, n_cats, gap_count, all_skills, top_skills,
                 cat_labels, cat_counts, q_buckets, gaps,
                 chinese_data=None, trends_data=None, dep_data=None,
@@ -119,7 +144,7 @@ def _build_html(*, total, avg_q, n_cats, gap_count, all_skills, top_skills,
     # Prepare all_skills as JSON for JS
     skills_json = json.dumps([
         {"name": s[0], "source": s[1], "stars": s[2], "downloads": s[3],
-         "quality": round(s[4], 1), "category": s[5]}
+         "quality": round(s[4], 1), "category": s[5], "url": s[6] if len(s) > 6 else ""}
         for s in all_skills
     ])
 
@@ -141,7 +166,7 @@ def _build_html(*, total, avg_q, n_cats, gap_count, all_skills, top_skills,
         top_rows += f"""
         <tr data-cat="{s[5]}" data-quality="{s[4]:.0f}" data-stars="{s[2]}" data-name="{s[0].lower()}">
           <td>{i}</td>
-          <td><span class="badge" style="background:{badge_color}">{badge}</span> {s[0]}</td>
+          <td><span class="badge" style="background:{badge_color}">{badge}</span> <a href="{s[6] if len(s) > 6 and s[6] else '#'}" target="_blank" style="color:var(--accent2);text-decoration:none">{s[0]}</a></td>
           <td>⭐ {s[2]:,}</td>
           <td>{s[3]:,}</td>
           <td><span class="qscore">{s[4]:.0f}</span></td>
@@ -405,14 +430,14 @@ const CHINESE_DATA = {json.dumps(chinese_data or {}, ensure_ascii=False)};
 const TRENDS_DATA = {json.dumps(trends_data or {}, ensure_ascii=False)};
 const DEP_DATA = {json.dumps(dep_data or {}, ensure_ascii=False)};
 const CONTRIB_DATA = {json.dumps(contrib_data or {}, ensure_ascii=False)};
-const REC_DATA = {json.dumps(rec_data or [], ensure_ascii=False)};
+const REC_DATA = {json.dumps(rec_data if rec_data else _auto_recommend(all_skills), ensure_ascii=False)};
 
 // Populate recommendations
 if (REC_DATA && REC_DATA.length > 0) {{
   const recList = document.getElementById('recList');
   REC_DATA.forEach(r => {{
     recList.innerHTML += `<div style="padding:6px 0;border-bottom:1px solid var(--border)">
-      <span style="color:var(--accent2);font-weight:600">${{r.name}}</span>
+      <span style="color:var(--accent2);font-weight:600"><a href="${{r.url}}" target="_blank" style="color:var(--accent2);text-decoration:none" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${{r.name}}</a></span>
       <span class="cat-tag" style="margin-left:6px">${{r.category}}</span>
       <span style="color:var(--accent4);margin-left:6px">Q:${{r.quality_score}}</span>
       <br><span style="color:var(--muted);font-size:0.78rem">${{r.reason}}</span>

@@ -196,6 +196,7 @@ def scan_clawhub(conn: sqlite3.Connection):
         skill["quality_score"] = compute_quality(skill)
         skill["readme_quality"] = readme_quality_label(desc)
         upsert_skill(conn, skill)
+        skill["url"] = f"https://clawhub.com/skills/{name}"
         count += 1
 
     print(f"[scan] ClawHub: {count} skills")
@@ -289,7 +290,9 @@ def generate_report(conn: sqlite3.Connection, top: int = 20):
     # Security & Compatibility statistics
     print(f"\n--- Security Overview ---")
     print(f"  (Security scanning available per-skill with scan_security())")
-    print(f"  Use --dashboard for per-skill security ratings")
+    print(f"  PII detection integrated — scan_pii() checks for emails, phone numbers,")
+    print(f"  API keys, IP addresses, ID cards, bank cards, and URL secrets.")
+    print(f"  Use --dashboard for per-skill security & PII ratings")
 
     print(f"\n--- Platform Compatibility Overview ---")
     print(f"  (Compatibility checking available per-skill with check_compatibility())")
@@ -612,6 +615,76 @@ SECURITY_PATTERNS = [
     (re.compile(r'open\s*\([^)]*["\']w["\']'), "file_write", "low"),
 ]
 
+# ---------------------------------------------------------------------------
+# PII Scanner
+# ---------------------------------------------------------------------------
+
+PII_PATTERNS = [
+    # (regex, pii_type)
+    (re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}'), "email"),
+    (re.compile(r'\b1[3-9]\d{9}\b'), "phone"),
+    (re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'), "ip_address"),
+    (re.compile(r'\b(?:sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|AKIA[A-Z0-9]{16}|cfut_[a-zA-Z0-9]+|tvly-[a-zA-Z0-9]+)\b'), "api_key"),
+    (re.compile(r'\b\d{17}[\dXx]\b'), "id_card"),
+    (re.compile(r'\b\d{16,19}\b'), "bank_card"),
+    (re.compile(r'[?&](?:token|secret|api_key|access_token|password)=[^&\s]{6,}', re.IGNORECASE), "url_secret"),
+]
+
+PII_SCAN_EXTENSIONS = {".py", ".js", ".md", ".yaml", ".yml"}
+
+
+def _mask_value(val: str) -> str:
+    """Show only first 3 and last 3 chars."""
+    if len(val) <= 6:
+        return "***"
+    return val[:3] + "***" + val[-3:]
+
+
+def scan_pii(skill_dir: str) -> dict:
+    """Scan a skill directory for PII (personally identifiable information)."""
+    findings = []
+    skill_path = Path(skill_dir)
+
+    if not skill_path.is_dir():
+        return {"pii_count": 0, "findings": [], "risk_level": "none"}
+
+    for fpath in skill_path.rglob("*"):
+        if fpath.suffix not in PII_SCAN_EXTENSIONS or not fpath.is_file():
+            continue
+        try:
+            lines = fpath.read_text(errors="ignore").splitlines()
+        except Exception:
+            continue
+        rel = str(fpath.relative_to(skill_path))
+        for lineno, line in enumerate(lines, 1):
+            for pattern, pii_type in PII_PATTERNS:
+                for m in pattern.finditer(line):
+                    value = m.group(0)
+                    # Exclude localhost / loopback IPs
+                    if pii_type == "ip_address" and value in ("127.0.0.1", "0.0.0.0"):
+                        continue
+                    findings.append({
+                        "type": pii_type,
+                        "value_masked": _mask_value(value),
+                        "file": rel,
+                        "line": lineno,
+                    })
+
+    pii_count = len(findings)
+    if pii_count == 0:
+        risk_level = "none"
+    elif pii_count <= 3:
+        risk_level = "low"
+    else:
+        risk_level = "high"
+
+    return {"pii_count": pii_count, "findings": findings, "risk_level": risk_level}
+
+
+# ---------------------------------------------------------------------------
+# Security Scanner
+# ---------------------------------------------------------------------------
+
 def scan_security(skill_dir: str) -> dict:
     """Scan a skill directory for security risks."""
     risks = []
@@ -662,7 +735,10 @@ def scan_security(skill_dir: str) -> dict:
     else:
         rating = "caution"
 
-    return {"score": score, "risks": risks, "rating": rating}
+    # PII integration
+    pii_result = scan_pii(skill_dir)
+
+    return {"score": score, "risks": risks, "rating": rating, "pii": pii_result}
 
 
 # ---------------------------------------------------------------------------
